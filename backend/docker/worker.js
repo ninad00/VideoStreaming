@@ -33,7 +33,7 @@ const MODAL_PROCESS_URL = process.env.MODAL_PROCESS_URL;
 const sqs = new SQSClient({ region: REGION });
 
 const { QueueUrl } = await sqs.send(
-  new GetQueueUrlCommand({ QueueName: "kyu" })
+  new GetQueueUrlCommand({ QueueName: process.env.AWS_SQS_NAME })
 );
 
 const s3 = new S3Client({
