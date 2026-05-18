@@ -7,7 +7,6 @@ from transformers import AutoModel, AutoProcessor
 from sentence_transformers import SentenceTransformer
 from google.generativeai import GenerativeModel
 from dotenv import load_dotenv
-import subprocess
 import numpy as np
 import torch
 from sklearn.cluster import KMeans
@@ -18,6 +17,9 @@ from io import BytesIO
 from PIL import Image
 from pydantic import BaseModel
 from concurrent.futures import ThreadPoolExecutor
+import tempfile
+import subprocess
+from PIL import Image
 
 class ProcessRequest(BaseModel):
     video_id: str
@@ -43,13 +45,14 @@ def download_models():
     
     # Download sentence transformer
     SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    whisper.load_model("base", device="cpu")
     
     print("✓ Models downloaded")
 
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg")
+    .apt_install("ffmpeg","texlive-latex-base","texlive-latex-extra","texlive-fonts-recommended")
     .pip_install(
         "openai-whisper==20250625",
         "numpy",
@@ -70,12 +73,20 @@ image = (
     ).run_function(download_models)
 )
 
-    
+import time
+import functools
 
-#################################
-#HELPER FUNCTIONS
-#################################
+def benchmark(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"[BENCHMARK] {func.__name__} took {elapsed:.3f}s")
+        return result
+    return wrapper
 
+# @benchmark
 def upload_frame_to_s3(frame_np,bucket: str,video_id: str,frame_index: int,s3_client=None,quality: int = 70):
     img = Image.fromarray(frame_np).convert("RGB")
     buffer = BytesIO()
@@ -90,15 +101,18 @@ def upload_frame_to_s3(frame_np,bucket: str,video_id: str,frame_index: int,s3_cl
     )
 
     return key
+
+# @benchmark
 def extract_keyframes(duration: int, video_id: str,siglip_model=None,siglip_processor=None, device=None, s3_client=None,):
     
     video_path=f"https://{os.environ['AWS_OUT_BUCKET']}.s3.{os.environ['AWS_REGION']}.amazonaws.com/{video_id}/master.m3u8"
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    if siglip_model is None or siglip_processor is None:
-        model_name = "google/siglip-so400m-patch14-384"
-        siglip_model = AutoModel.from_pretrained(model_name).to(device)
-        siglip_processor = AutoProcessor.from_pretrained(model_name, use_fast=True)
+    if siglip_model is None:
+        raise RuntimeError("Model not loaded")
+    if siglip_processor is None:
+        raise RuntimeError("Processor not loaded")
+        
 
     clusters = 40 if duration <= 300 else 80 if duration <= 800 else 100
     probe_cmd = [
@@ -112,39 +126,54 @@ def extract_keyframes(duration: int, video_id: str,siglip_model=None,siglip_proc
     data = json.loads(subprocess.check_output(probe_cmd))
     w, h = data["streams"][0]["width"], data["streams"][0]["height"]
 
+    scale_w = 384
+    raw_h = h * scale_w / w
+    scale_h = int(raw_h) if int(raw_h) % 2 == 0 else int(raw_h) + 1  # match -2 rounding
+
+    frame_size = scale_w * scale_h * 3
+
     # ---- FFmpeg frame extraction (NO timestamps) ----
     cmd = [
         "ffmpeg",
         "-i", video_path,
-        "-vf", "scale=iw/2:ih/2",
-        "-vsync", "vfr",
+        "-vf", f"fps=0.5,scale={scale_w}:{scale_h}",
+        # "-vsync", "vfr",
         "-f", "rawvideo",
         "-pix_fmt", "rgb24",
+        "-an",
         "pipe:1"
     ]
 
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        bufsize=10**8
+    )
 
-    frame_size = (w // 2) * (h // 2) * 3
+    # scale_w = 384
+    # scale_h = int(h * (384 / w))
+
+    # frame_size = scale_w * scale_h * 3
     frames_list = []
 
-    while True:
-        raw = process.stdout.read(frame_size)
-        if len(raw) != frame_size:
-            break
-        frame = np.frombuffer(raw, np.uint8).reshape((h // 2, w // 2, 3))
-        frames_list.append(frame)
+    try:
+        while True:
+            raw = process.stdout.read(frame_size)
+            if not raw or len(raw) < frame_size:
+                break
+            frame = np.frombuffer(raw, np.uint8).reshape((scale_h, scale_w, 3))
+            frames_list.append(frame)
+    finally:
+        process.stdout.close()
+        process.wait(timeout=10)
 
-    process.stdout.close()
-    process.wait()
 
     if not frames_list:
         return [], np.empty((0,))
 
-    all_frames = np.array(frames_list)
+    all_frames = frames_list
     num_frames = len(all_frames)
 
-    # ---- SIGLIP embeddings ----
     embeddings = []
     batch_size = 8
 
@@ -164,8 +193,7 @@ def extract_keyframes(duration: int, video_id: str,siglip_model=None,siglip_proc
 
     embeddings = np.vstack(embeddings)
 
-    # ---- KMeans selection ----
-    k = min(clusters, num_frames)
+    k = min(clusters, num_frames//2)
     kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
     labels = kmeans.fit_predict(embeddings)
     centroids = kmeans.cluster_centers_
@@ -204,6 +232,8 @@ def extract_keyframes(duration: int, video_id: str,siglip_model=None,siglip_proc
     keyframe_embeddings = np.array(keyframe_emb_list)
 
     return keyframes_meta, keyframe_embeddings
+
+# @benchmark
 def chunk_full_transcript(text: str, max_chars=300):
     words = text.split()
     chunks = []
@@ -219,6 +249,8 @@ def chunk_full_transcript(text: str, max_chars=300):
         chunks.append(" ".join(current))
 
     return chunks
+    
+# @benchmark
 def store_text_embeddings(full_transcript: str,video_id:str,sentence_model=None,supabase=None,):
     
     chunks = chunk_full_transcript(full_transcript)
@@ -237,6 +269,8 @@ def store_text_embeddings(full_transcript: str,video_id:str,sentence_model=None,
         })
 
     supabase.table("text_embeddings").upsert(rows).execute()
+
+@benchmark
 def store_image_embeddings(keyframes_meta: list[dict],image_embeddings: list[list[float]],video_id:str,supabase=None):
     rows = []
     for meta, emb in zip(keyframes_meta, image_embeddings):
@@ -247,6 +281,7 @@ def store_image_embeddings(keyframes_meta: list[dict],image_embeddings: list[lis
         })
 
     supabase.table("image_embeddings").upsert(rows).execute()
+
 def retrieve_text_by_query(query: str,video_id: str, top_k: int = 5,sentence_model=None,supabase=None
 ):
     query_embedding = sentence_model.encode(query).tolist()
@@ -265,6 +300,13 @@ def retrieve_images_by_query(vlm_query: str,video_id: str, top_k: int = 8,siglip
     
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if siglip_processor is None:
+        raise RuntimeError("Processor not loaded")
+    
+    if siglip_model is None:
+        raise RuntimeError("Model not loaded")
+    
     inputs = siglip_processor(
         text=[vlm_query],
         return_tensors="pt",
@@ -375,6 +417,7 @@ def download_image_from_s3(object_key: str, s3_client=None) -> Image.Image:
         print(f"[WARN] Missing S3 key: {object_key}")
         return None
 
+@benchmark
 def transcribe( video_id: str, whisper_model=None) -> str:
     m3u8_url=f"https://{os.environ['AWS_OUT_BUCKET']}.s3.{os.environ['AWS_REGION']}.amazonaws.com/{video_id}/audio/index.m3u8"
     
@@ -436,6 +479,285 @@ def rag_with_gemini(video_id:str,query_actual: str,query_vlm: str,rag_text: str,
     response = gemini_model.generate_content(message_parts)
     return response.text
 
+
+def generate_intro_section(all_chunks: list[str], gemini_model):
+    """
+    Generates a short introduction section for study notes.
+    Returns:
+        {
+            "title": "...",
+            "intro": "..."
+        }
+    """
+
+    STRICT_PROMPT = (
+        "You are a professional academic notes generator.\n\n"
+        "Based on the full transcript provided, generate a concise introduction "
+        "for study notes. The introduction should:\n"
+        "- Provide a brief overview of the video's content\n"
+        "- Highlight the main themes covered\n"
+        "- Be clear and professional\n"
+        "- Be 3-5 sentences maximum\n\n"
+        "OUTPUT FORMAT (JSON ONLY):\n"
+        "{\n"
+        '  "title": "Short descriptive title for the notes",\n'
+        '  "intro": "Concise introductory paragraph"\n'
+        "}\n\n"
+        "Return ONLY valid JSON. No markdown. No explanations."
+    )
+
+    full_transcript = "\n\n".join(all_chunks)
+
+    response = gemini_model.generate_content([
+        f"{STRICT_PROMPT}\n\nTranscript:\n{full_transcript}"
+    ])
+
+    try:
+        parsed = json.loads(response.text)
+    except Exception:
+        
+        cleaned = response.text.strip()
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+        parsed = json.loads(cleaned[start:end])
+
+    return parsed
+
+################################
+#PDF GENERATION                #
+################################
+
+def generate_pdf(video_id:str,gemini_model=None,supabase=None,sentence_model=None,siglip_model=None,siglip_processor=None, device=None):
+    RETRIEVAL_QUERY="GIVE ME ALL THE IMPORTANT CONCEPTS PRESENTED IN THE VIDEO,TO BE USED TO MAKE NOTES FOR STUDYING PURPOSES"
+    all_chunks=retrieve_text_by_query(video_id=video_id,top_k=50,query=RETRIEVAL_QUERY,sentence_model=sentence_model,supabase=supabase)
+    half_transcript = "\n\n".join(all_chunks[:len(all_chunks)//2])
+    end_transcript = "\n\n".join(all_chunks[len(all_chunks)//2:])
+    
+    STRICT_CONTEXT = (
+    "You are a smart professional notes generator that creates study notes for students based on video transcripts.\n"
+    "You are currently given a PART of the transcript of a video, and your task is to generate study notes that summarize the key concepts, ideas, and information presented in this part of the video.\n"
+    "The notes should be clear and detailed for students to use for revision and understanding of the video content.\n\n"
+    "Also,only if required add a visual query that can be used to retrieve relevant images/diagrams that would help in understanding the topic better. This visual query should be specific and descriptive to ensure the retrieved images are highly relevant to the topic.\n\n"
+    "OUTPUT FORMAT (JSON):\n"
+    "{\n"
+    '  "topics": [\n'
+    "    {\n"
+    '      "topic_number": 1,\n'
+    '      "topic_title": "Clear, descriptive title",\n'
+    '      "topic_description": "Detailed explanation of the topic covering key concepts, definitions, examples, and important points",\n'
+    '      "visual_query": "If required a visual query to retrieve relevant images/diagrams for this topic.Else leave empty"\n'
+    "    }\n"
+    "  ]\n"
+    "}\n\n"
+    
+    "REQUIREMENTS:\n"
+    "- Identify 1-5 major topics from this transcript segment\n"
+    "- Each topic_description should be comprehensive (2-5 sentences)\n"
+    "- visual_query should be specific and descriptive if required\n"
+    "- Return ONLY valid JSON, no markdown formatting or code blocks\n"
+)
+    gemini_response = gemini_model.generate_content([
+        f"{STRICT_CONTEXT}\nTranscript Segment:\n{half_transcript}"
+    ])
+
+    gemini_response2 = gemini_model.generate_content([
+        f"{STRICT_CONTEXT}\nTranscript Segment:\n{end_transcript}"
+    ])
+
+    intro_response = generate_intro_section(all_chunks, gemini_model)  
+    
+    resp1 = json.loads(gemini_response.text)
+    resp2 = json.loads(gemini_response2.text)
+
+    notes = resp1.get("topics", []) + resp2.get("topics", [])
+
+    for i, note in enumerate(notes):
+        if note["visual_query"]:
+            images_indices = retrieve_images_by_query(note["visual_query"],video_id=video_id, supabase=supabase, top_k=1,siglip_model=siglip_model,siglip_processor=siglip_processor, device=device)
+            note["image_url"] = []
+            for frame_index in images_indices:
+                image_url = f"https://{os.environ['AWS_OUT_BUCKET']}.s3.{os.environ['AWS_REGION']}.amazonaws.com/{video_id}/frames/{int(frame_index)}.jpg"
+                note["image_url"].append(image_url)
+        note.pop("visual_query",None)
+
+    # HISTORY_PROMPT = ("Generate a Doubts section citing the question and answer pairs from the conversation history that are relevant to the video content. This section should be helpful for students to clarify common doubts and misconceptions related to the video topics. If no relevant Q&A pairs are found, return an empty list."
+    #                   "it should be titled 'Doubts' and each doubt should be in the format:\n\n"
+    #                     "## Doubt\n"
+    #                     "- Question: <the question>\n"
+    #                     "- Answer: <the answer>\n\n"
+    #                     "Return ONLY the Doubts section in markdown format, no explanations or additional text.")
+    # history_response = gemini_model.generate_content([
+    #     f"{HISTORY_PROMPT}\nConversation History:\n{history}"])
+    notes_pdf_content = {
+        "title": intro_response.get("title", "Study Notes"),
+        "introduction": intro_response.get("intro", ""),
+        "notes": notes
+    }
+    return notes_pdf_content
+
+def escape_latex(text: str) -> str:
+    replacements = {
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+        "\\": r"\textbackslash{}",
+    }
+    for key, val in replacements.items():
+        text = text.replace(key, val)
+    return text
+
+def upload_pdf_to_s3(
+    pdf_path: str,
+    bucket: str,
+    video_id: str,
+    s3_client=None
+):
+    key = f"{video_id}/sn.pdf"
+
+    with open(pdf_path, "rb") as f:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=f,
+            ContentType="application/pdf",
+        )
+
+    return key
+
+def build_and_upload_pdf(
+    notes_pdf_content: dict,
+    video_id: str,
+    s3_client=None
+):
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+
+        tex_path = os.path.join(tmpdir, "notes.tex")
+        pdf_path = os.path.join(tmpdir, "notes.pdf")
+
+        # ----------------------------
+        # LaTeX Header + Title Page
+        # ----------------------------
+        latex_content = r"""
+\documentclass[12pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{lmodern}
+\usepackage{setspace}
+\usepackage{parskip}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{\thepage}
+\lhead{Study Notes}
+
+\definecolor{sectionblue}{RGB}{25, 70, 150}
+
+\titleformat{\section}
+  {\Large\bfseries\color{sectionblue}}
+  {\thesection}{1em}{}
+
+\title{%s}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\begin{titlepage}
+    \centering
+    \vspace*{2cm}
+    {\Huge\bfseries %s\par}
+    \vspace{1cm}
+    {\Large Comprehensive Study Notes\par}
+    \vfill
+    {\large Generated on \today\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section*{Introduction}
+\addcontentsline{toc}{section}{Introduction}
+\onehalfspacing
+%s
+\newpage
+""" % (
+            escape_latex(notes_pdf_content["title"]),
+            escape_latex(notes_pdf_content["title"]),
+            escape_latex(notes_pdf_content["introduction"])
+        )
+        for idx, topic in enumerate(notes_pdf_content["notes"], start=1):
+
+            latex_content += "\n\\section{%s}\n" % escape_latex(topic["topic_title"])
+            latex_content += "\\vspace{0.3cm}\n"
+            latex_content += "%s\n\n" % escape_latex(topic["topic_description"])
+            latex_content += "\\vspace{0.5cm}\n"
+
+            if topic.get("image_url"):
+
+                for img_i, img_url in enumerate(topic["image_url"]):
+
+                    object_key = img_url.split(".amazonaws.com/")[-1]
+                    image = download_image_from_s3(object_key, s3_client=s3_client)
+
+                    if image:
+                        local_img_path = os.path.join(tmpdir, f"{idx}_{img_i}.jpg")
+                        image.save(local_img_path)
+
+                        latex_content += r"""
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\linewidth]{%s}
+\caption{Illustration related to the topic}
+\vspace{0.3cm}
+\end{figure}
+""" % local_img_path
+
+        latex_content += "\n\\end{document}"
+
+        # Write .tex file
+        with open(tex_path, "w", encoding="utf-8") as f:
+            f.write(latex_content)
+
+        # Compile
+        subprocess.run(
+            ["pdflatex", "-interaction=nonstopmode", "notes.tex"],
+            cwd=tmpdir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        upload_pdf_to_s3(
+            pdf_path,
+            bucket=os.environ["AWS_OUT_BUCKET"],
+            video_id=video_id,
+            s3_client=s3_client
+        )
+
+        return {
+            "status": "uploaded",
+            "s3_key": f"{video_id}/sn.pdf"
+        }
+
+    
 ##################################
 #ENDPOINTS
 ##################################
@@ -443,48 +765,106 @@ def rag_with_gemini(video_id:str,query_actual: str,query_vlm: str,rag_text: str,
     image=image,
     gpu="L4",
     timeout=60 * 60,
-    concurrency_limit=1,
+    max_containers=1,
+    enable_memory_snapshot=True,
     secrets=[modal.Secret.from_name("videorag-secrets")]
 )
 class VideoProcessor:
-    @modal.enter()
+    @modal.enter(snap=True)
     def load_models(self):
         from supabase import create_client
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
         load_dotenv()
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.siglip_model = AutoModel.from_pretrained(
-            "google/siglip-so400m-patch14-384",torch_dtype=torch.float16
-        ).to(self.device)
+        def load_siglip_model():
+            return AutoModel.from_pretrained(
+                "google/siglip-so400m-patch14-384",
+                torch_dtype=torch.float16
+            ).to(self.device)
+        
+        def load_siglip_processor():
+            return AutoProcessor.from_pretrained(
+                "google/siglip-so400m-patch14-384",
+                use_fast=True
+            )
+        
+        def load_sentence_model():
+            return SentenceTransformer(
+                "sentence-transformers/all-MiniLM-L6-v2"
+            )
+        
+        def load_gemini():
+            import google.generativeai as genai
+            from google.generativeai import GenerativeModel
+            genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+            return GenerativeModel("gemini-2.5-flash")
+        
+        def load_groq():
+            from groq import Groq
+            return Groq(api_key=os.environ["GROQ_API_KEY"])
+        
+        def load_s3():
+            import boto3
+            session = boto3.Session(
+                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+                region_name=os.environ["AWS_REGION"],
+            )
+            return session.client("s3")
+        
+        def load_supabase():
+            from supabase import create_client
+            return create_client(
+                os.environ["SUPABASE_URL"],
+                os.environ["SUPABASE_SERVICE_KEY"]
+            )
+        def load_whisper():
+            return whisper.load_model("base", device=self.device)
+        
+        # Load all models concurrently
+        load_functions_map = {
+            "siglip_model": load_siglip_model,
+            "siglip_processor": load_siglip_processor,
+            "sentence_model": load_sentence_model,
+            "gemini_model": load_gemini,
+            "groq_client": load_groq,
+            "s3": load_s3,
+            "supabase": load_supabase,
+            "whisper_model": load_whisper
 
-        self.siglip_processor = AutoProcessor.from_pretrained(
-            "google/siglip-so400m-patch14-384",
-            use_fast=True
-        )
-
-        self.whisper_model = None
-        self.sentence_model = SentenceTransformer(
-            "sentence-transformers/all-MiniLM-L6-v2"
-        ).half()
-
-        session = boto3.Session(
-            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-            region_name=os.environ["AWS_REGION"],
-        )
-        self.s3 = session.client("s3")
-
-        self.supabase = create_client(
-            os.environ["SUPABASE_URL"],
-            os.environ["SUPABASE_SERVICE_KEY"]
-        )
-
+        }
+        
+        components = {}
+        with ThreadPoolExecutor(max_workers=len(load_functions_map)) as executor:
+            future_to_model_id = {
+                executor.submit(load_fn): model_id 
+                for model_id, load_fn in load_functions_map.items()
+            }
+            
+            for future in as_completed(future_to_model_id.keys()):
+                model_id = future_to_model_id[future]
+                try:
+                    components[model_id] = future.result()
+                except Exception as exc:
+                    print(f'{model_id} generated an exception: {exc}')
+                    raise
+        
+        
+        self.siglip_model = components["siglip_model"]
+        self.siglip_processor = components["siglip_processor"]
+        self.sentence_model = components["sentence_model"]
+        self.gemini_model = components["gemini_model"]
+        self.groq_client = components["groq_client"]
+        self.s3 = components["s3"]
+        self.supabase = components["supabase"]
+        self.whisper_model = components["whisper_model"]
+        
     @modal.method()
     def process(self, video_id: str, duration: int):
-        if self.whisper_model is None:
-            self.whisper_model = whisper.load_model("base", device=self.device)
-
+        
         metadata, embeddings = extract_keyframes(
             duration=duration,
             video_id=video_id,
@@ -509,16 +889,26 @@ class VideoProcessor:
             image_embeddings=embeddings,
             supabase=self.supabase
         )
+        # notes=generate_pdf(
+        #     video_id=video_id,
+        #     gemini_model=self.gemini_model,
+        #     supabase=self.supabase,
+        #     sentence_model=self.sentence_model,
+        #     siglip_model=self.siglip_model,
+        #     siglip_processor=self.siglip_processor,
+        #     device=self.device
+        # )
+        # build_and_upload_pdf(video_id=video_id,notes_pdf_content=notes,s3_client=self.s3)
 
         return {"status": "processed", "video_id": video_id}
 
 @app.cls(
     image=image,
-    gpu="L4",
-    timeout=60 * 5,
-    concurrency_limit=2,
+    gpu="A100",
+    timeout=60 * 10,
+    max_containers=1,
     enable_memory_snapshot=True,
-    experimental_options={"enable_gpu_snapshot": True},
+    # experimental_options={"enable_gpu_snapshot": True},
     secrets=[modal.Secret.from_name("videorag-secrets")]
 )
 class VideoChat:
@@ -625,8 +1015,17 @@ class VideoChat:
         )
 
         vlm_query = make_query_for_vlm(query, text_ans, self.groq_client)
-
-        return rag_with_gemini(
+        short_note_resp=generate_pdf(
+            video_id=video_id,
+            history=history,
+            gemini_model=self.gemini_model,
+            supabase=self.supabase,
+            sentence_model=self.sentence_model,
+            siglip_model=self.siglip_model,
+            siglip_processor=self.siglip_processor,
+            device=self.device
+        )
+        rag_response=rag_with_gemini(
             video_id=video_id,
             query_actual=query,
             query_vlm=vlm_query,
@@ -640,6 +1039,11 @@ class VideoChat:
             supabase=self.supabase
         )
 
+        return {
+            "short_notes": short_note_resp,
+            "rag_response": rag_response
+        }
+    
 video_processor = VideoProcessor()
 video_chat = VideoChat()
 
@@ -649,10 +1053,12 @@ video_chat = VideoChat()
 )
 @modal.fastapi_endpoint(method="POST")
 def process_endpoint(req: ProcessRequest):
-    return video_processor.process.remote(
+    video_processor.process.spawn(
         video_id=req.video_id,
         duration=req.duration
     )
+
+    return {"status": "processing started"}
 
 
 @app.function(

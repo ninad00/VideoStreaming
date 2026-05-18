@@ -53,27 +53,29 @@ export async function processVideo(inputPath, outputDir) {
         { scale: "854:480", bitrate: "1400k", bw: 1528000, res: "854x480", idx: 2 }
     ];
 
-    for (const q of qualities) {
-        await runFFmpeg([
-            "-i", inputPath,
-            "-vf", `scale=${q.scale},format=yuv420p`,
-            "-map", "0:v:0",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-profile:v", "main",
-            "-crf", "20",
-            "-g", "48",
-            "-sc_threshold", "0",
-            "-b:v", q.bitrate,
-            "-an",
-            "-f", "hls",
-            "-hls_time", "4",
-            "-hls_playlist_type", "vod",
-            "-hls_flags", "independent_segments",
-            "-hls_segment_filename", `${outputDir}/v${q.idx}/seg_%03d.ts`,
-            `${outputDir}/v${q.idx}/index.m3u8`
-        ]);
-    }
+    await Promise.all(
+        qualities.map(q =>
+            runFFmpeg([
+                "-i", inputPath,
+                "-vf", `scale=${q.scale},format=yuv420p`,
+                "-map", "0:v:0",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-profile:v", "main",
+                "-crf", "20",
+                "-g", "48",
+                "-sc_threshold", "0",
+                "-b:v", q.bitrate,
+                "-an",
+                "-f", "hls",
+                "-hls_time", "4",
+                "-hls_playlist_type", "vod",
+                "-hls_flags", "independent_segments",
+                "-hls_segment_filename", `${outputDir}/v${q.idx}/seg_%03d.ts`,
+                `${outputDir}/v${q.idx}/index.m3u8`
+            ])
+        ));
+
 
     const audioExists = await hasAudio(inputPath);
 
@@ -91,6 +93,15 @@ export async function processVideo(inputPath, outputDir) {
             "-hls_flags", "independent_segments",
             "-hls_segment_filename", `${outputDir}/audio/seg_%03d.ts`,
             `${outputDir}/audio/index.m3u8`
+        ]);
+
+        await runFFmpeg([
+            "-i", inputPath,
+            "-map", "0:a:0",
+            "-ac", "1",              // mono (important for Whisper)
+            "-ar", "16000",          // 16kHz (Whisper standard)
+            "-c:a", "pcm_s16le",     // WAV format
+            path.join(outputDir, "audio", "whisper.wav")
         ]);
     }
 
@@ -133,7 +144,7 @@ export async function processVideo(inputPath, outputDir) {
         ]);
     }
 
-    return { success: true, outputDir, audio: audioExists };
-}
+    return { success: true, outputDir, audio: audioExists, whisperAudio: audioExists ? path.join(outputDir, "audio", "whisper.wav") : null };
 
+}
 

@@ -2,14 +2,23 @@ import prisma from '../prisma.js';
 
 export async function getVideos(req, res) {
     try {
+        const search = req.query.search || "";
         const videos = await prisma.video.findMany({
+            where: {
+                title: {
+                    contains: search,
+                    // mode: "insensitive",
+                },
+            },
             orderBy: { createdAt: 'desc' },
             select: {
                 id: true,
                 title: true,
                 thumbnail: true,
                 description: true,
-                duration: true
+                duration: true,
+                uploaderName: true
+
             }
         });
 
@@ -18,14 +27,42 @@ export async function getVideos(req, res) {
             title: video.title,
             thumbnail_url: video.thumbnail,
             description: video.description,
-            duration: video.duration
+            duration: video.duration,
+            uploaderName: video.uploaderName
         }));
-
+        console.log("SEARCH:", search);
+        console.log(videos.map(v => v.id));
         res.json(data);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 }
+// export const getVideos = async (req, res) => {
+//     try {
+
+//         const search = req.query.search || "";
+
+//         const videos = await prisma.video.findMany({
+//             where: {
+//                 title: {
+//                     contains: search,
+//                     // mode: "insensitive",
+//                 },
+//             },
+//         });
+
+//         console.log("SEARCH:", search);
+
+//         res.json(videos);
+
+//     } catch (err) {
+//         console.error(err);
+
+//         res.status(500).json({
+//             error: "Failed to fetch videos",
+//         });
+//     }
+// };
 
 export async function getVideoById(req, res) {
     try {
@@ -42,7 +79,8 @@ export async function getVideoById(req, res) {
             title: video.title,
             hls_url: video.hls,
             description: video.description,
-            duration: video.duration
+            duration: video.duration,
+            uploaderName: video.uploaderName
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
