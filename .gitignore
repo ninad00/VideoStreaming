@@ -28,3 +28,4 @@ Thumbs.db
 # ---- Logs ----
 *.log
 
+backend/docker_db/dump.sql
