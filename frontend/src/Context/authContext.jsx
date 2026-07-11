@@ -2,7 +2,7 @@ import { createContext, useContext, useEffect, useState } from "react";
 import axios from "axios";
 
 const api = axios.create({
-    baseURL: "https://videositebackend-production.up.railway.app",
+    baseURL: "https://videostreaming-production-8880.up.railway.app",
     withCredentials: true
 });
 
@@ -39,7 +39,7 @@ export const AuthProvider = ({ children }) => {
 
 
     const googleLogin = async () => {
-        window.location.href = "https://videositebackend-production.up.railway.app/auth/google";
+        window.location.href = "https://videostreaming-production-8880.up.railway.app/auth/google";
     };
 
 

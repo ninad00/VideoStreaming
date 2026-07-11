@@ -90,7 +90,7 @@ const Signup = () => {
 
         try {
             await axios.post(
-                "https://videositebackend-production.up.railway.app/auth/register",
+                "https://videostreaming-production-8880.up.railway.app/auth/register",
                 {
                     username,
                     password,

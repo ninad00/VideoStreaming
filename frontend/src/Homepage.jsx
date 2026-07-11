@@ -102,7 +102,7 @@ export default function HomePage() {
       setLoading(true);
 
       const res = await axios.get(
-        `https://videositebackend-production.up.railway.app/video/`,
+        `https://videostreaming-production-8880.up.railway.app/video/`,
         {
           params: {
             search: query,

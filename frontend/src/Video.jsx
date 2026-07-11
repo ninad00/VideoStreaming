@@ -230,7 +230,7 @@ export default function PlayerPage() {
       try {
 
         const res = await axios.get(
-          `https://videositebackend-production.up.railway.app/video/${id}`
+          `https://videostreaming-production-8880.up.railway.app/video/${id}`
         );
 
         setVideo(res.data);
