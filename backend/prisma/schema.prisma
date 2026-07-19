@@ -1,8 +1,4 @@
-// This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
 
 generator client {
   provider = "prisma-client-js"
@@ -13,25 +9,27 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Video {
-  id           String  @id @default(uuid())
-  title        String?
-  description  String?
-  thumbnail    String?
-  hls          String?
-  uploaderName String?
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
 
-  // S3
-  rawBucket String
-  outBucket String
-
-  // status
-  status VideoStatus @default(UPLOADED)
-
-  // optional metadata
-  duration  Float?
-  createdAt DateTime @default(now())
+enum VideoStatus {
+  UPLOADED
+  PROCESSING
+  TRANSCODED
+  FAILED
 }
+
+enum SubtitleStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// -----------------------------------------------------------------------------
+// MODELS
+// -----------------------------------------------------------------------------
 
 model User {
   id           String  @id @default(uuid())
@@ -40,9 +38,43 @@ model User {
   passwordHash String
   avatarUrl    String?
   googlesub    String? @unique
+  
+  // Relations
+  videos       Video[] // One-to-many relationship with Video
+  
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 }
 
-enum VideoStatus {
-  UPLOADED
-  READY
+model Video {
+  id           String  @id @default(uuid())
+  title        String?
+  description  String?
+  thumbnail    String?
+  hls          String?
+  
+  // Relations
+  userId       String
+  uploader     User    @relation(fields: [userId], references: [id])
+
+  // S3
+  rawBucket    String
+  outBucket    String
+
+  // System Status & State Checkpointing
+  status         VideoStatus    @default(UPLOADED)
+  subtitleStatus SubtitleStatus @default(PENDING)
+
+  // Optimistic Concurrency Control (Row-level locking)
+  version      Int @default(1)
+
+  // Optional metadata
+  duration     Float?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Indexes for query performance optimization
+  @@index([userId])
+  @@index([status, subtitleStatus]) // Composite index for worker sweeper jobs
+  @@index([createdAt(sort: Desc)])
 }
